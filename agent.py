@@ -1,7 +1,19 @@
 """Agent loop tự viết (không dùng framework). Contract chi tiết trong GUIDE.md."""
 import json
+import time
 
 from status_tools import SCHEMAS
+
+# Lỗi provider tạm thời (rate limit, lỗi server, mất kết nối) được retry có giới hạn;
+# không tính là một step vì model chưa trả lời. Hết retry thì run kết thúc với error.
+PROVIDER_RETRIES = 4
+RETRY_BACKOFF_SECONDS = (5, 15, 30, 60)
+TRANSIENT_MARKERS = ('HTTP 429', 'HTTP 500', 'HTTP 502', 'HTTP 503', 'HTTP 504', 'Không kết nối được', 'timed out')
+
+
+def _is_transient(exc):
+    text = str(exc)
+    return isinstance(exc, (TimeoutError, ConnectionError)) or any(m in text for m in TRANSIENT_MARKERS)
 
 SYSTEM_PROMPT = '''Bạn là trợ lý điều tra trạng thái GitHub và Cloudflare.
 Dùng tools trước khi khẳng định về trạng thái. Phân biệt incident hiện tại và lịch sử,
@@ -48,13 +60,22 @@ def run_agent(question, provider, tools, max_steps=6):
         return out
 
     for step in range(1, max_steps + 1):
-        # 1. Gọi model. Lỗi provider kết thúc run với status error.
-        try:
-            response = provider.complete(messages, schemas)
-        except Exception as exc:  # noqa: BLE001
-            error = f'{type(exc).__name__}: {str(exc)[:200]}'
-            trace.append({'event': 'provider_error', 'step': step, 'error': error})
-            return done('error', error=error)
+        # 1. Gọi model. Lỗi tạm thời được retry có giới hạn; còn lại kết thúc run với error.
+        response = None
+        for attempt in range(PROVIDER_RETRIES + 1):
+            try:
+                response = provider.complete(messages, schemas)
+                break
+            except Exception as exc:  # noqa: BLE001
+                error = f'{type(exc).__name__}: {str(exc)[:200]}'
+                if attempt < PROVIDER_RETRIES and _is_transient(exc):
+                    wait = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
+                    trace.append({'event': 'provider_retry', 'step': step, 'attempt': attempt + 1,
+                                  'wait_seconds': wait, 'error': error})
+                    time.sleep(wait)
+                    continue
+                trace.append({'event': 'provider_error', 'step': step, 'error': error})
+                return done('error', error=error)
 
         message = response.get('message') or {'role': 'assistant', 'content': None}
         calls = response.get('calls') or []
